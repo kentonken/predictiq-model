@@ -3,7 +3,7 @@ import numpy as np
 from catboost import CatBoostClassifier
 from features import FEATURE_COLUMNS
 
-MODEL_PATH = os.getenv("MODEL_PATH", "model/catboost_model.cbm")
+MODEL_PATH = os.getenv("MODEL_PATH", "catboost_model.cbm")
 OUTCOME_LABELS = {0: "Home Win", 1: "Draw", 2: "Away Win"}
 
 def load_model():
