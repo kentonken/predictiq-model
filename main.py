@@ -86,4 +86,4 @@ def predict_batch(fixture_ids: list[int]):
             errors.append({"fixture_id": fid, "error": str(e)})
             
     return {"predictions": results, "errors": errors}
-        
+    
