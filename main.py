@@ -87,4 +87,4 @@ def predict_batch(fixture_ids: list[int]):
             results.append(result)
         except Exception as e:
             errors.append({"fixture_id": fid, "error": str(e)})
-    return {"predictions": results, "errors":
+    return {"predictions": results, "errors": errors}
