@@ -41,14 +41,18 @@ def predict(req: PredictRequest):
         if cached:
             cached["cached"] = True
             return cached
+            
     features = compute_features(req.fixture_id)
     if not features:
         raise HTTPException(status_code=404, detail="Fixture not found")
+        
     result = predict_match(model, features, req.fixture_id)
+    
     try:
         save_prediction(result)
     except Exception as e:
         print(f"Could not save to Supabase: {e}")
+        
     result["cached"] = False
     return result
 
@@ -56,8 +60,10 @@ def predict(req: PredictRequest):
 def predict_batch(fixture_ids: list[int]):
     if len(fixture_ids) > 20:
         raise HTTPException(status_code=400, detail="Max 20 fixtures per batch")
+        
     results = []
     errors = []
+    
     for fid in fixture_ids:
         try:
             cached = get_prediction(fid)
@@ -65,14 +71,19 @@ def predict_batch(fixture_ids: list[int]):
                 cached["cached"] = True
                 results.append(cached)
                 continue
+                
             features = compute_features(fid)
             if not features:
                 errors.append({"fixture_id": fid, "error": "Not found"})
                 continue
+                
             result = predict_match(model, features, fid)
             save_prediction(result)
             result["cached"] = False
             results.append(result)
+            
         except Exception as e:
             errors.append({"fixture_id": fid, "error": str(e)})
+            
     return {"predictions": results, "errors": errors}
+        
