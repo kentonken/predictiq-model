@@ -26,27 +26,15 @@ class PredictRequest(BaseModel):
     fixture_id: int
     use_cache: bool = True
 
-class PredictResponse(BaseModel):
-    fixture_id: int
-    home_team: str
-    away_team: str
-    prediction: str
-    confidence: float
-    home_win_prob: float
-    draw_prob: float
-    away_win_prob: float
-    tip: str
-    cached: bool = False
-
 @app.get("/")
 def root():
-    return {"status": "PredictIQ Model API is running", "version": "2.0.0"}
+    return {"status": "PredictIQ Model API is running"}
 
 @app.get("/health")
 def health():
     return {"status": "ok", "model_loaded": model is not None}
 
-@app.post("/predict", response_model=PredictResponse)
+@app.post("/predict")
 def predict(req: PredictRequest):
     if req.use_cache:
         cached = get_prediction(req.fixture_id)
@@ -55,12 +43,12 @@ def predict(req: PredictRequest):
             return cached
     features = compute_features(req.fixture_id)
     if not features:
-        raise HTTPException(status_code=404, detail=f"Fixture {req.fixture_id} not found")
+        raise HTTPException(status_code=404, detail="Fixture not found")
     result = predict_match(model, features, req.fixture_id)
     try:
         save_prediction(result)
     except Exception as e:
-        print(f"Warning: Could not save to Supabase: {e}")
+        print(f"Could not save to Supabase: {e}")
     result["cached"] = False
     return result
 
