@@ -1,18 +1,29 @@
-import job_model # or whatever your model loading library is
+import os
+from catboost import CatBoostClassifier
 
 def load_model():
-    # This represents your model loading logic
-    return "model_placeholder"
+    # This must match the filename you uploaded to GitHub!
+    model_path = os.path.join(os.getcwd(), "catboost_model.cbm")
+    
+    if os.path.exists(model_path):
+        model = CatBoostClassifier()
+        model.load_model(model_path)
+        return model
+    else:
+        print(f"ERROR: {model_path} not found in repository")
+        return None
 
 def predict_match(model, features, fid):
-    # This is where your prediction logic lives
-    # Assuming these variables (strength, prediction, pct) are calculated here:
-    strength = "Strong"
-    prediction = "Home Win"
-    pct = 75
+    if model is None:
+        return {"error": "Model not loaded", "fixture_id": fid}
     
-    # FIX: Added the missing closing brace and quote below
-    return f"{strength}: {prediction} ({pct}%)"
-
-# If you have other functions in this file, make sure they 
-# are indented correctly as well.
+    # This assumes 'features' is a list or array your model expects
+    prediction = model.predict(features)
+    
+    # CatBoost returns an array, we take the first value
+    return {
+        "fixture_id": fid,
+        "prediction": str(prediction[0]) if hasattr(prediction, "__getitem__") else str(prediction),
+        "status": "success"
+    }
+    
