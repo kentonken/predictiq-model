@@ -1,52 +1,56 @@
-from pydantic import BaseModel
-from typing import List, Optional
-from fastapi import FastAPI
-import pandas as pd
-from catboost import CatBoostClassifier
 import os
+import pandas as pd
+from fastapi import FastAPI
+from firecrawl import FirecrawlApp
+from catboost import CatBoostClassifier
+import requests
 
 app = FastAPI()
+firecrawl = FirecrawlApp(api_key=os.getenv("FIRECRAWL_API_KEY"))
+model = CatBoostClassifier().load_model("catboost_model.cbm")
 
-MODEL_PATH = "catboost_model.cbm"
-model = CatBoostClassifier()
+# --- STEP 1: Get Basic Info from TheSportsDB ---
+def get_fixture_info(match_id):
+    # Free Tier uses '1' as key, or use your Premium Key
+    url = f"https://www.thesportsdb.com/api/v1/json/3/lookupevent.php?id={match_id}"
+    data = requests.get(url).json()
+    return data['events'][0]
 
-if os.path.exists(MODEL_PATH):
-    model.load_model(MODEL_PATH)
-else:
-    print("Model file missing!")
+# --- STEP 2: Scrape Deep Stats with Firecrawl ---
+def scrape_match_stats(url):
+    # Firecrawl turns a website into clean JSON for your model
+    scraped_data = firecrawl.scrape_url(url, params={
+        'extractor_options': {
+            'extraction_schema': {
+                'type': 'object',
+                'properties': {
+                    'home_possession': {'type': 'number'},
+                    'away_possession': {'type': 'number'},
+                    'home_shots': {'type': 'number'},
+                    'away_shots': {'type': 'number'}
+                }
+            }
+        }
+    })
+    return scraped_data['data']
 
-class MatchInput(BaseModel):
-    # Basic info
-    home_team: str
-    away_team: str
+@app.post("/predict/smart")
+async def smart_predict(match_id: str, scrape_url: str):
+    # 1. Get metadata
+    base_info = get_fixture_info(match_id)
     
-    # The stats your model is looking for (based on your training error)
-    home_league_position: int = 0
-    away_league_position: int = 0
-    home_pts: int = 0
-    away_pts: int = 0
-    home_avg_goals: float = 0.0
-    away_avg_goals: float = 0.0
-    home_h2h_wins: int = 0
-    away_h2h_wins: int = 0
-
-@app.post("/predict/batch")
-async def predict_batch(data: List[MatchInput]):
-    try:
-        # 1. Convert to DataFrame
-        df = pd.DataFrame([d.dict() for d in data])
-        
-        # 2. DROP only the name columns
-        # The model needs the rest to match its 'pool'
-        features = df.drop(columns=['home_team', 'away_team'])
-        
-        # 3. Predict
-        probs = model.predict_proba(features)
-        
-        # 4. Return Home Win probability (Index 1)
-        results = [float(p[1]) for p in probs]
-        return {"predictions": results}
+    # 2. Get live stats
+    stats = scrape_match_stats(scrape_url)
     
-    except Exception as e:
-        return {"error": str(e)}
-        
+    # 3. Combine and Predict
+    # (Ensure the dictionary keys match your MatchInput class from before)
+    final_features = pd.DataFrame([{
+        "home_league_position": int(base_info.get("intHomeLeaguePos", 0)),
+        "home_pts": int(base_info.get("intHomePoints", 0)),
+        "home_possession": stats["home_possession"],
+        # ... add all other features here
+    }])
+    
+    prob = model.predict_proba(final_features)[0][1]
+    return {"home_win_probability": float(prob)}
+    
