@@ -1,47 +1,60 @@
+import os
+import pandas as pd
+from typing import List
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List
-import pandas as pd
 from catboost import CatBoostClassifier
-import os
 
 app = FastAPI()
 
-# Load the model you trained in Colab
+# 1. Load the CatBoost model 
 MODEL_PATH = "catboost_model.cbm"
 model = CatBoostClassifier()
+
 if os.path.exists(MODEL_PATH):
-    model.load_model(MODEL_PATH)
+    try:
+        model.load_model(MODEL_PATH)
+        MODEL_LOADED = True
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        MODEL_LOADED = False
+else:
+    MODEL_LOADED = False
 
 class MatchData(BaseModel):
     home_team: str
     away_team: str
-    # Stats from TheSportsDB
     home_league_position: int
     away_league_position: int
     home_pts: int
     away_pts: int
-    # Live stats from Firecrawl (via Lovable)
     home_possession: float
     away_possession: float
     home_shots: float
     away_shots: float
-    # Poisson inputs
     home_avg_goals_scored: float
     away_avg_goals_conceded: float
     league_avg_goals: float = 1.35 
 
 def calculate_poisson_lambda(scored, conceded, avg):
-    """Calculates the Poisson home win probability factor."""
     if avg == 0: return 0.0
     return (scored / avg) * (conceded / avg) * avg
 
+@app.get("/")
+async def health():
+    return {
+        "status": "online",
+        "model_file_exists": os.path.exists(MODEL_PATH),
+        "model_successfully_loaded": MODEL_LOADED
+    }
+
 @app.post("/predict/hybrid")
 async def predict_hybrid(data: List[MatchData]):
+    if not MODEL_LOADED:
+        return {"error": "Model not loaded on server. Check logs."}
     try:
         rows = []
         for m in data:
-            # Generate the Poisson feature your model needs
             h_lambda = calculate_poisson_lambda(
                 m.home_avg_goals_scored, 
                 m.away_avg_goals_conceded, 
@@ -57,14 +70,12 @@ async def predict_hybrid(data: List[MatchData]):
                 "away_possession": m.away_possession,
                 "home_shots": m.home_shots,
                 "away_shots": m.away_shots,
-                "poisson_home_lambda": h_lambda # Feature name must match your training set
+                "poisson_home_lambda": h_lambda # Ensure this matches Colab exactly!
             })
 
         df = pd.DataFrame(rows)
-        # Your model's prediction probability for a Home Win (Index 1)
         probs = model.predict_proba(df)
         return {"predictions": [float(p[1]) for p in probs]}
-        
     except Exception as e:
         return {"error": str(e)}
         
