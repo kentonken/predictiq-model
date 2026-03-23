@@ -48,7 +48,7 @@ async def health():
         "model_successfully_loaded": MODEL_LOADED
     }
 
-@app.post("/predict/hybrid")
+@app.post("/predict_hybrid")
 async def predict_hybrid(data: List[MatchData]):
     if not MODEL_LOADED:
         return {"error": "Model not loaded on server. Check logs."}
