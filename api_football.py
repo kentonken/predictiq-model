@@ -9,7 +9,10 @@ HEADERS = {"x-apisports-key": API_KEY}
 def _get(endpoint: str, params: dict) -> dict:
     if not API_KEY:
         raise Exception("API_FOOTBALL_KEY environment variable is not set")
-    res = requests.get(f"{BASE_URL}/{endpoint}", headers=HEADERS, params=params, timeout=10)
+    url = f"{BASE_URL}/{endpoint}"
+    if not (url.startswith("https://") or url.startswith("http://")):
+        raise ValueError("Invalid URL scheme")
+    res = requests.get(url, headers=HEADERS, params=params, timeout=10)
     res.raise_for_status()
     return res.json()
 
