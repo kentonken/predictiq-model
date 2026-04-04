@@ -1,6 +1,6 @@
 import os
 import pandas as pd
-from typing import List
+from typing import List, Union  # Added Union for flexibility
 from fastapi import FastAPI
 from pydantic import BaseModel
 from catboost import CatBoostClassifier
@@ -50,21 +50,25 @@ async def health():
     }
 
 @app.post("/predict_hybrid")
-async def predict_hybrid(data: List[MatchData]):
+async def predict_hybrid(data: Union[MatchData, List[MatchData]]):
     if not MODEL_LOADED:
         return {"error": "Model not loaded on server."}
-    
+
+    # FIX: If a single object is sent, wrap it in a list so the loop works
+    if not isinstance(data, list):
+        data = [data]
+
     try:
         rows = []
         matches_info = []
-        
+
         for m in data:
             h_lambda = calculate_poisson_lambda(
-                m.home_avg_goals_scored, 
-                m.away_avg_goals_conceded, 
+                m.home_avg_goals_scored,
+                m.away_avg_goals_conceded,
                 m.league_avg_goals
             )
-            
+
             # This must match the features your model was trained on
             rows.append({
                 "home_league_position": m.home_league_position,
@@ -80,17 +84,20 @@ async def predict_hybrid(data: List[MatchData]):
             matches_info.append(f"{m.home_team} vs {m.away_team}")
 
         df = pd.DataFrame(rows)
-        # Get probabilities for class 1 (usually the 'Over' or 'Win' class)
-        probs = model.predict_proba(df)[:, 1] 
         
+        # Get probabilities for class 1 (usually the 'Over' or 'Win' class)
+        probs = model.predict_proba(df)[:, 1]
+
         final_predictions = []
         for i, prob in enumerate(probs):
             # Market Decision Logic
             prediction = "OVER 2.5" if prob > 0.55 else "UNDER 2.5"
             
             # Value Bet Detection: High League Avg + High ML Probability
-            is_value = (data[i].league_avg_goals > 3.0) and (prob > 0.6)
-            
+            # Accessing league_avg_goals from the input data list
+            current_avg = data[i].league_avg_goals
+            is_value = (current_avg > 3.0) and (prob > 0.6)
+
             final_predictions.append({
                 "match": matches_info[i],
                 "market": "Goals (O/U 2.5)",
