@@ -1,43 +1,81 @@
 import os
-import pandas as pd
-from catboost import CatBoostClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, accuracy_score
-from features import FEATURE_COLUMNS
+from api_bzzoiro import get_fixture
+from predictor import predict_match, load_model
+from supabase_client import save_prediction
 
-DATA_PATH = "data/historical_matches.csv"
-MODEL_DIR = "model"
-MODEL_PATH = os.path.join(MODEL_DIR, "catboost_model.cbm")
+def run_daily_predictions():
+    # 1. Load the CatBoost model from the repository
+    model = load_model()
+    if not model:
+        print("Error: Model could not be loaded. Check catboost_model.cbm.")
+        return
 
-def train():
-    if not os.path.exists(DATA_PATH):
-        raise FileNotFoundError(f"No training data at {DATA_PATH}. Run build_training_data.py first.")
-    print("Loading training data...")
-    df = pd.read_csv(DATA_PATH)
-    print(f"Dataset: {len(df)} matches")
-    missing = [col for col in FEATURE_COLUMNS if col not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns: {missing}")
-    X = df[FEATURE_COLUMNS].fillna(0)
-    y = df["result"]
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-    print(f"Training on {len(X_train)}, validating on {len(X_val)}...")
-    model = CatBoostClassifier(
-        iterations=500, learning_rate=0.05, depth=6,
-        loss_function="MultiClass", eval_metric="Accuracy",
-        random_seed=42, verbose=100, early_stopping_rounds=50,
-    )
-    model.fit(X_train, y_train, eval_set=(X_val, y_val))
-    y_pred = model.predict(X_val)
-    acc = accuracy_score(y_val, y_pred)
-    print(f"\nValidation Accuracy: {round(acc * 100, 1)}%")
-    print(classification_report(y_val, y_pred, target_names=["Home Win", "Draw", "Away Win"]))
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    model.save_model(MODEL_PATH)
-    print(f"Model saved to {MODEL_PATH}")
-    print("Commit model/catboost_model.cbm to GitHub.")
+    # 2. Targeted "Hidden Gem" Leagues (e.g., Poland, Kazakhstan, etc.)
+    # Add your specific strategy league IDs here
+    leagues = [348, 350, 281, 282] 
+    
+    for league_id in leagues:
+        print(f"Fetching fixtures for league: {league_id}")
+        matches = get_fixture(league_id) 
+        
+        if not matches:
+            print(f"No matches found for league {league_id}")
+            continue
+            
+        for match in matches:
+            fixture = match.get('fixture', {})
+            teams = match.get('teams', {})
+            league_info = match.get('league', {})
+            odds = match.get('odds', {}) 
+
+            # 3. Handle Kickoff Time to fix "TBD" in Lovable UI
+            raw_date = fixture.get('date') # Format: 2026-04-07T18:45:00+00:00
+            m_date = raw_date.split('T')[0] if raw_date else None
+            m_time = raw_date.split('T')[1][:5] if raw_date else None
+
+            # 4. Prepare Features & Generate Prediction
+            # Ensure this matches the feature order in your training logic
+            try:
+                # You'll need to pass the actual feature list your model expects here
+                features = [] 
+                prediction_results = predict_match(model, features, fixture.get('id'))
+            except Exception as e:
+                print(f"Prediction failed for fixture {fixture.get('id')}: {e}")
+                continue
+
+            # 5. Construct the Full Payload for Supabase
+            final_data = {
+                "fixture_id": fixture.get('id'),
+                "match_date": m_date,
+                "match_time": m_time,
+                "home_team": teams.get('home', {}).get('name'),
+                "away_team": teams.get('away', {}).get('name'),
+                "home_logo": teams.get('home', {}).get('logo'),
+                "away_logo": teams.get('away', {}).get('logo'),
+                "home_code": teams.get('home', {}).get('code'),
+                "away_code": teams.get('away', {}).get('code'),
+                "league": league_info.get('name'),
+                "country": league_info.get('country'),
+                
+                # Odds Mapping (Verify keys against Bzzoiro API response)
+                "bookmaker": "Bet365", 
+                "odds_1x2": odds.get('1x2', {}).get('home'),
+                "odds_over25": odds.get('over_under', {}).get('over'),
+                "odds_btts": odds.get('btts', {}).get('yes'),
+                
+                # CatBoost Model Outputs
+                "prediction": prediction_results.get('prediction'),
+                "confidence": prediction_results.get('confidence'),
+                "home_win_prob": prediction_results.get('home_win_prob'),
+                "draw_prob": prediction_results.get('draw_prob'),
+                "away_win_prob": prediction_results.get('away_win_prob'),
+                "tip": prediction_results.get('tip')
+            }
+
+            # 6. Push to Supabase (Triggers your new client logic)
+            save_prediction(final_data)
+            print(f"Saved: {final_data['home_team']} vs {final_data['away_team']}")
 
 if __name__ == "__main__":
-    train()
+    run_daily_predictions()
+            
