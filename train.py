@@ -5,7 +5,7 @@ from supabase_client import save_prediction
 
 def run_daily_predictions():
     model = load_model()
-    # Ensure Champions League (2) and niche leagues are included
+    # IDs: 2 (UCL), 183 (Kazakhstan), 31 (Azerbaijan), 10 (Iceland), 57 (Finland)
     leagues = [2, 183, 31, 10, 57] 
     
     for league_id in leagues:
@@ -15,12 +15,12 @@ def run_daily_predictions():
             teams = match.get('teams', {})
             odds = match.get('odds', {}) 
 
-            # Fix for "TBD": Extracting ISO components
+            # THE TBD FIX: Precise splitting of the ISO date string
             raw_date = fixture.get('date') 
             m_date = raw_date.split('T')[0] if raw_date else None
             m_time = raw_date.split('T')[1][:5] if raw_date else None
 
-            # Generate model prediction
+            # Prediction logic
             prediction_results = predict_match(model, [], fixture.get('id'))
 
             final_data = {
@@ -38,4 +38,8 @@ def run_daily_predictions():
                 "tip": prediction_results.get('tip')
             }
             save_prediction(final_data)
-            
+            print(f"Sync Complete: {final_data['home_team']} vs {final_data['away_team']}")
+
+if __name__ == "__main__":
+    run_daily_predictions()
+    
