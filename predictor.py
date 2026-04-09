@@ -1,27 +1,46 @@
 """
 predictor.py — PredictIQ Pro v5.0
-Lazy imports to prevent Railway startup crash.
+Auto-downloads model from Supabase Storage if not present locally.
 """
 
 import math
 import os
+import logging
 import numpy as np
 import pandas as pd
 from pathlib import Path
 
-MODEL_PATH = os.getenv("MODEL_PATH", "models/ensemble_v5.pkl")
-_model = None
+logger   = logging.getLogger(__name__)
+MODEL_PATH = Path(os.getenv("MODEL_PATH", "models/ensemble_v5.pkl"))
+_model   = None
 
 
 def get_model():
     global _model
-    if _model is None and Path(MODEL_PATH).exists():
+    if _model is not None:
+        return _model
+
+    # Try local file first
+    if MODEL_PATH.exists():
         import joblib
         _model = joblib.load(MODEL_PATH)
-    return _model
+        logger.info("✅ Model loaded from local file")
+        return _model
+
+    # Try downloading from Supabase Storage
+    logger.info("📥 Model not found locally — downloading from Supabase Storage...")
+    from model_store import download_model
+    if download_model() and MODEL_PATH.exists():
+        import joblib
+        _model = joblib.load(MODEL_PATH)
+        logger.info("✅ Model loaded from Supabase Storage")
+        return _model
+
+    logger.warning("⚠️ No model available — run POST /train first")
+    return None
 
 
-# ── Poisson helpers ────────────────────────────────────
+# ── Poisson helpers ───────────────────────────────────
 
 def _poisson(lam: float, k: int) -> float:
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
@@ -39,7 +58,7 @@ def most_likely_score(home_xg: float, away_xg: float) -> str:
     return f"{h}-{a}"
 
 def over_under_probs(home_xg: float, away_xg: float):
-    sm = _score_matrix(home_xg, away_xg)
+    sm   = _score_matrix(home_xg, away_xg)
     p15  = round(sum(p for (h,a),p in sm.items() if h+a > 1) * 100, 1)
     p25  = round(sum(p for (h,a),p in sm.items() if h+a > 2) * 100, 1)
     p35  = round(sum(p for (h,a),p in sm.items() if h+a > 3) * 100, 1)
@@ -47,20 +66,20 @@ def over_under_probs(home_xg: float, away_xg: float):
     return p15, p25, p35, btts
 
 
-# ── Main predict function ──────────────────────────────
+# ── Predict ───────────────────────────────────────────
 
 def predict(input_data: dict) -> dict:
     from features import engineer_features
 
     model = get_model()
     if model is None:
-        raise RuntimeError("Model not loaded. Train and push models/ensemble_v5.pkl first.")
+        raise RuntimeError("No model loaded. Call POST /train first.")
 
-    df = pd.DataFrame([input_data])
-    X  = engineer_features(df)
+    df    = pd.DataFrame([input_data])
+    X     = engineer_features(df)
+    lid   = int(input_data.get("league_id", 0))
+    proba = model.predict_proba(X, league_id=lid)[0]
 
-    league_id = int(input_data.get("league_id", 0))
-    proba     = model.predict_proba(X, league_id=league_id)[0]
     p_home, p_draw, p_away = float(proba[0]), float(proba[1]), float(proba[2])
     predicted = ["H", "D", "A"][int(np.argmax(proba))]
 
@@ -68,7 +87,6 @@ def predict(input_data: dict) -> dict:
                     input_data.get("poisson_home_goals", 1.4)))
     away_xg = float(input_data.get("bzz_expected_away_goals",
                     input_data.get("poisson_away_goals", 1.1)))
-
     home_xg = home_xg * 0.7 + (p_home * 2.5) * 0.3
     away_xg = away_xg * 0.7 + (p_away * 2.5) * 0.3
 
@@ -78,28 +96,28 @@ def predict(input_data: dict) -> dict:
     fav_prob   = max(p_home, p_away) * 100
 
     return {
-        "prob_home_win":    round(p_home * 100, 1),
-        "prob_draw":        round(p_draw * 100, 1),
-        "prob_away_win":    round(p_away * 100, 1),
-        "predicted_result": predicted,
+        "prob_home_win":       round(p_home * 100, 1),
+        "prob_draw":           round(p_draw * 100, 1),
+        "prob_away_win":       round(p_away * 100, 1),
+        "predicted_result":    predicted,
         "expected_home_goals": round(home_xg, 2),
         "expected_away_goals": round(away_xg, 2),
         "most_likely_score":   most_likely_score(home_xg, away_xg),
-        "prob_over_15": p15,
-        "prob_over_25": p25,
-        "prob_over_35": p35,
-        "prob_btts":    p_btts,
-        "confidence":        round(confidence, 3),
-        "model_version":     "Ensemble v5.0 (CB+XGB+LGB)",
-        "features_used":     len(X.columns),
-        "spatial_data_used": any(k.startswith("bzz_") for k in input_data),
-        "favorite":           fav,
-        "favorite_prob":      round(fav_prob, 1),
-        "favorite_recommend": fav_prob >= 55.0,
-        "over_15_recommend":  p15 >= 72.0,
-        "over_25_recommend":  p25 >= 55.0,
-        "over_35_recommend":  p35 >= 28.0,
-        "btts_recommend":     p_btts >= 52.0,
-        "winner_recommend":   predicted != "D" and max(p_home, p_away) >= 0.50,
+        "prob_over_15":        p15,
+        "prob_over_25":        p25,
+        "prob_over_35":        p35,
+        "prob_btts":           p_btts,
+        "confidence":          round(confidence, 3),
+        "model_version":       "Ensemble v5.0 (CB+XGB+LGB)",
+        "features_used":       len(X.columns),
+        "spatial_data_used":   any(k.startswith("bzz_") for k in input_data),
+        "favorite":            fav,
+        "favorite_prob":       round(fav_prob, 1),
+        "favorite_recommend":  fav_prob >= 55.0,
+        "over_15_recommend":   p15 >= 72.0,
+        "over_25_recommend":   p25 >= 55.0,
+        "over_35_recommend":   p35 >= 28.0,
+        "btts_recommend":      p_btts >= 52.0,
+        "winner_recommend":    predicted != "D" and max(p_home, p_away) >= 0.50,
     }
     
