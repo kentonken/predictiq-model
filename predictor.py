@@ -1,34 +1,27 @@
 """
 predictor.py — PredictIQ Pro v5.0
-Wraps EnsembleStacker with Poisson xG blend and recommendation thresholds
-Replaces existing predictor.py
+Lazy imports to prevent Railway startup crash.
 """
 
 import math
+import os
 import numpy as np
 import pandas as pd
-import joblib
-import os
 from pathlib import Path
 
-from features import engineer_features
-from train import EnsembleStacker
-
 MODEL_PATH = os.getenv("MODEL_PATH", "models/ensemble_v5.pkl")
+_model = None
 
-# Singleton load
-_model: EnsembleStacker = None
 
-def get_model() -> EnsembleStacker:
+def get_model():
     global _model
     if _model is None and Path(MODEL_PATH).exists():
-        _model = EnsembleStacker.load(MODEL_PATH)
+        import joblib
+        _model = joblib.load(MODEL_PATH)
     return _model
 
 
-# ─────────────────────────────────────────────
-# POISSON HELPERS (kept from old predictor)
-# ─────────────────────────────────────────────
+# ── Poisson helpers ────────────────────────────────────
 
 def _poisson(lam: float, k: int) -> float:
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
@@ -54,69 +47,52 @@ def over_under_probs(home_xg: float, away_xg: float):
     return p15, p25, p35, btts
 
 
-# ─────────────────────────────────────────────
-# MAIN PREDICT FUNCTION
-# ─────────────────────────────────────────────
+# ── Main predict function ──────────────────────────────
 
 def predict(input_data: dict) -> dict:
-    """
-    input_data: flat dict matching features.py columns.
-    Pass bzz_* fields directly from Bzzoiro /api/predictions/ response.
-    Returns full prediction dict matching PredictIQ Pro response schema.
-    """
+    from features import engineer_features
+
     model = get_model()
     if model is None:
-        raise RuntimeError("Model not loaded. Run train.py first.")
+        raise RuntimeError("Model not loaded. Train and push models/ensemble_v5.pkl first.")
 
     df = pd.DataFrame([input_data])
     X  = engineer_features(df)
 
     league_id = int(input_data.get("league_id", 0))
-    proba = model.predict_proba(X, league_id=league_id)[0]
+    proba     = model.predict_proba(X, league_id=league_id)[0]
     p_home, p_draw, p_away = float(proba[0]), float(proba[1]), float(proba[2])
     predicted = ["H", "D", "A"][int(np.argmax(proba))]
 
-    # xG: prefer Bzzoiro values, fall back to Poisson columns
     home_xg = float(input_data.get("bzz_expected_home_goals",
                     input_data.get("poisson_home_goals", 1.4)))
     away_xg = float(input_data.get("bzz_expected_away_goals",
                     input_data.get("poisson_away_goals", 1.1)))
 
-    # Blend xG with 1X2 signal (30%)
     home_xg = home_xg * 0.7 + (p_home * 2.5) * 0.3
     away_xg = away_xg * 0.7 + (p_away * 2.5) * 0.3
 
     p15, p25, p35, p_btts = over_under_probs(home_xg, away_xg)
-
-    confidence = float(max(proba))
-    has_spatial = any(k.startswith("bzz_") for k in input_data)
-    if has_spatial:
-        confidence = min(confidence * 1.05, 0.99)
-
-    fav      = "H" if p_home > p_away else ("A" if p_away > p_home else None)
-    fav_prob = max(p_home, p_away) * 100
+    confidence = min(float(max(proba)) * 1.05, 0.99)
+    fav        = "H" if p_home > p_away else ("A" if p_away > p_home else None)
+    fav_prob   = max(p_home, p_away) * 100
 
     return {
-        # 1X2
-        "prob_home_win":   round(p_home * 100, 1),
-        "prob_draw":       round(p_draw * 100, 1),
-        "prob_away_win":   round(p_away * 100, 1),
+        "prob_home_win":    round(p_home * 100, 1),
+        "prob_draw":        round(p_draw * 100, 1),
+        "prob_away_win":    round(p_away * 100, 1),
         "predicted_result": predicted,
-        # xG
         "expected_home_goals": round(home_xg, 2),
         "expected_away_goals": round(away_xg, 2),
         "most_likely_score":   most_likely_score(home_xg, away_xg),
-        # O/U
         "prob_over_15": p15,
         "prob_over_25": p25,
         "prob_over_35": p35,
         "prob_btts":    p_btts,
-        # Meta
         "confidence":        round(confidence, 3),
         "model_version":     "Ensemble v5.0 (CB+XGB+LGB)",
         "features_used":     len(X.columns),
-        "spatial_data_used": has_spatial,
-        # Recommendations
+        "spatial_data_used": any(k.startswith("bzz_") for k in input_data),
         "favorite":           fav,
         "favorite_prob":      round(fav_prob, 1),
         "favorite_recommend": fav_prob >= 55.0,
