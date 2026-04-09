@@ -1,13 +1,14 @@
 """
 main.py — PredictIQ Pro FastAPI v5.0
-Lazy imports — app starts even before model is trained.
+Includes POST /train to build ensemble on Railway and persist to Supabase Storage.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 import logging
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,6 +25,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Auto-download model on startup
+@app.on_event("startup")
+async def startup():
+    from predictor import get_model
+    get_model()  # triggers Supabase download if needed
 
 
 # ── Request schema ─────────────────────────────────────
@@ -175,6 +182,80 @@ class PredictionRequest(BaseModel):
     bzz_model_version_enc: int = 5
 
 
+class TrainRequest(BaseModel):
+    date_from: str = "2025-10-01"   # start of training window
+    date_to: str = "2026-03-31"     # end of training window
+    league_id: Optional[int] = None # None = all leagues
+    n_folds: int = 5
+    secret: str = ""                # simple auth — set TRAIN_SECRET env var
+
+
+# ── Training job (runs in background) ─────────────────
+
+def _run_training(date_from: str, date_to: str, league_id, n_folds: int):
+    import pandas as pd
+    import traceback
+    global _training_status
+    _training_status = {"status": "running", "message": "Fetching data from Bzzoiro..."}
+
+    try:
+        # 1. Fetch training data from Bzzoiro
+        from api_bzzoiro import get_finished_predictions_for_training
+        from features import engineer_features
+        from train import EnsembleStacker
+        from model_store import upload_model
+
+        logger.info(f"Fetching matches {date_from} → {date_to}")
+        rows = get_finished_predictions_for_training(
+            date_from=date_from,
+            date_to=date_to,
+            league_id=league_id
+        )
+
+        if len(rows) < 50:
+            _training_status = {"status": "error",
+                                 "message": f"Only {len(rows)} matches found — need at least 50"}
+            return
+
+        df = pd.DataFrame(rows)
+        _training_status["message"] = f"Training on {len(df)} matches..."
+        logger.info(f"Training on {len(df)} matches")
+
+        X       = engineer_features(df)
+        y       = df["result"]
+        leagues = df.get("league_id", pd.Series([0] * len(df)))
+
+        # 2. Train ensemble
+        model = EnsembleStacker(n_folds=n_folds)
+        model.fit(X, y, league_ids=leagues)
+
+        # 3. Upload to Supabase Storage
+        _training_status["message"] = "Uploading model to Supabase Storage..."
+        ok = upload_model(model)
+        if not ok:
+            _training_status = {"status": "error", "message": "Upload to Supabase failed"}
+            return
+
+        # 4. Hot-swap the in-memory model
+        import predictor
+        predictor._model = model
+
+        _training_status = {
+            "status":   "complete",
+            "message":  f"Trained on {len(df)} matches. Model live.",
+            "features": len(X.columns),
+            "samples":  len(df),
+        }
+        logger.info("✅ Training complete, model hot-swapped")
+
+    except Exception as e:
+        _training_status = {"status": "error", "message": str(e)}
+        logger.error(traceback.format_exc())
+
+
+_training_status = {"status": "idle", "message": "No training run yet"}
+
+
 # ── Endpoints ──────────────────────────────────────────
 
 @app.get("/health")
@@ -182,9 +263,9 @@ async def health():
     from predictor import get_model
     m = get_model()
     return {
-        "status": "ok",
+        "status":       "ok",
         "model_loaded": m is not None,
-        "version": "5.0.0",
+        "version":      "5.0.0",
         "architecture": "XGBoost + LightGBM + CatBoost → meta-learner",
     }
 
@@ -213,18 +294,43 @@ async def predict_batch(reqs: List[PredictionRequest]):
     return {"count": len(out), "predictions": out}
 
 
+@app.post("/train")
+async def trigger_training(req: TrainRequest, background_tasks: BackgroundTasks):
+    # Simple secret check
+    expected = os.getenv("TRAIN_SECRET", "")
+    if expected and req.secret != expected:
+        raise HTTPException(401, "Invalid secret")
+
+    if _training_status.get("status") == "running":
+        raise HTTPException(409, "Training already in progress")
+
+    background_tasks.add_task(
+        _run_training,
+        req.date_from,
+        req.date_to,
+        req.league_id,
+        req.n_folds,
+    )
+    return {"status": "started", "message": "Training running in background. Poll GET /train/status"}
+
+
+@app.get("/train/status")
+async def training_status():
+    return _training_status
+
+
 @app.get("/model/info")
 async def model_info():
     from predictor import get_model
     m = get_model()
     if m is None:
-        return {"status": "no model loaded", "note": "Train and push models/ensemble_v5.pkl"}
+        return {"status": "no model", "note": "Call POST /train to train"}
     return {
-        "version": "5.0.0",
-        "base_models": ["CatBoost", "XGBoost", "LightGBM"],
-        "meta_learner": "LogisticRegression",
-        "features": len(m.feature_names) if m.is_fitted else "untrained",
+        "version":            "5.0.0",
+        "base_models":        ["CatBoost", "XGBoost", "LightGBM"],
+        "meta_learner":       "LogisticRegression",
+        "features":           len(m.feature_names) if m.is_fitted else "untrained",
         "league_calibrators": list(m.calibrators.keys()),
-        "fitted": m.is_fitted,
-        }
+        "fitted":             m.is_fitted,
+    }
     
