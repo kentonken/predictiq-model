@@ -1,16 +1,13 @@
 """
 main.py — PredictIQ Pro FastAPI v5.0
-Keeps same endpoint signatures as before — Supabase edge function unchanged.
-Adds /predict/batch and /model/info.
+Lazy imports — app starts even before model is trained.
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Optional
+from pydantic import BaseModel
+from typing import Optional, List
 import logging
-
-from predictor import predict as run_predict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,7 +15,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="PredictIQ Pro ML API",
     version="5.0.0",
-    description="Ensemble Stacking: CatBoost + XGBoost + LightGBM | 163 features | Bzzoiro spatial"
+    description="Ensemble: CatBoost + XGBoost + LightGBM | 163 features | Bzzoiro spatial"
 )
 
 app.add_middleware(
@@ -29,28 +26,19 @@ app.add_middleware(
 )
 
 
-# ─────────────────────────────────────────────
-# REQUEST SCHEMA
-# ─────────────────────────────────────────────
+# ── Request schema ─────────────────────────────────────
 
 class PredictionRequest(BaseModel):
-    # Required context
     league_id: int = 0
     league_tier: int = 1
     match_week: int = 20
     season_progress: float = 0.5
     is_neutral_venue: int = 0
     is_derby: int = 0
-
-    # Elo
     home_elo: float = 1500.0
     away_elo: float = 1500.0
-
-    # League position
     home_league_pos: int = 8
     away_league_pos: int = 12
-
-    # Form
     home_win_rate_5: float = 0.5
     away_win_rate_5: float = 0.4
     home_draw_rate_5: float = 0.2
@@ -63,8 +51,6 @@ class PredictionRequest(BaseModel):
     away_win_rate_10: float = 0.4
     home_prev_match_result: int = 1
     away_prev_match_result: int = 1
-
-    # Goals / xG
     home_goals_scored_5: float = 1.5
     away_goals_scored_5: float = 1.1
     home_goals_conceded_5: float = 1.0
@@ -88,8 +74,6 @@ class PredictionRequest(BaseModel):
     away_scored_both_5: float = 0.6
     poisson_home_goals: float = 1.4
     poisson_away_goals: float = 1.1
-
-    # Shots
     home_shots_on_target_5: float = 4.5
     away_shots_on_target_5: float = 3.5
     home_total_shots_5: float = 12.0
@@ -110,8 +94,6 @@ class PredictionRequest(BaseModel):
     away_post_hits_5: float = 0.7
     home_penalty_rate: float = 0.08
     away_penalty_rate: float = 0.07
-
-    # Spatial — shotmap (Bzzoiro)
     home_avg_shot_x: float = 85.0
     away_avg_shot_x: float = 83.0
     home_avg_shot_xg: float = 0.12
@@ -122,8 +104,6 @@ class PredictionRequest(BaseModel):
     away_header_goals_rate: float = 0.18
     home_set_piece_goals_rate: float = 0.25
     away_set_piece_goals_rate: float = 0.22
-
-    # Spatial — momentum (Bzzoiro)
     home_momentum_avg_5: float = 5.0
     away_momentum_avg_5: float = -5.0
     home_momentum_peak_5: float = 25.0
@@ -138,8 +118,6 @@ class PredictionRequest(BaseModel):
     away_comeback_rate: float = 0.15
     home_goals_min_75_90_5: float = 0.4
     away_goals_min_75_90_5: float = 0.35
-
-    # Spatial — avg positions / tactics (Bzzoiro)
     home_avg_def_line_x: float = 35.0
     away_avg_def_line_x: float = 35.0
     home_avg_att_line_x: float = 75.0
@@ -156,8 +134,6 @@ class PredictionRequest(BaseModel):
     away_passes_per_game_5: float = 420.0
     home_crossing_rate_5: float = 0.25
     away_crossing_rate_5: float = 0.22
-
-    # Defensive
     home_tackles_won_5: float = 18.0
     away_tackles_won_5: float = 16.0
     home_interceptions_5: float = 12.0
@@ -172,8 +148,6 @@ class PredictionRequest(BaseModel):
     away_red_cards_5: float = 0.1
     home_corners_for_5: float = 5.5
     away_corners_for_5: float = 4.5
-
-    # Squad context
     home_squad_depth_score: float = 0.7
     away_squad_depth_score: float = 0.7
     home_injuries_count: int = 2
@@ -182,8 +156,6 @@ class PredictionRequest(BaseModel):
     away_season_goals_scored: int = 22
     days_since_last_home: int = 7
     days_since_last_away: int = 7
-
-    # Bzzoiro predictions — pass straight from their API response
     bzz_prob_home_win: float = 45.0
     bzz_prob_draw: float = 25.0
     bzz_prob_away_win: float = 30.0
@@ -203,9 +175,7 @@ class PredictionRequest(BaseModel):
     bzz_model_version_enc: int = 5
 
 
-# ─────────────────────────────────────────────
-# ENDPOINTS
-# ─────────────────────────────────────────────
+# ── Endpoints ──────────────────────────────────────────
 
 @app.get("/health")
 async def health():
@@ -215,15 +185,15 @@ async def health():
         "status": "ok",
         "model_loaded": m is not None,
         "version": "5.0.0",
-        "architecture": "XGBoost + LightGBM + CatBoost → LogReg meta-learner",
+        "architecture": "XGBoost + LightGBM + CatBoost → meta-learner",
     }
 
 
 @app.post("/predict")
 async def predict_endpoint(req: PredictionRequest):
     try:
-        result = run_predict(req.dict())
-        return result
+        from predictor import predict as run_predict
+        return run_predict(req.dict())
     except RuntimeError as e:
         raise HTTPException(503, str(e))
     except Exception as e:
@@ -232,9 +202,10 @@ async def predict_endpoint(req: PredictionRequest):
 
 
 @app.post("/predict/batch")
-async def predict_batch(requests: list[PredictionRequest]):
+async def predict_batch(reqs: List[PredictionRequest]):
+    from predictor import predict as run_predict
     out = []
-    for r in requests:
+    for r in reqs:
         try:
             out.append(run_predict(r.dict()))
         except Exception as e:
@@ -247,7 +218,7 @@ async def model_info():
     from predictor import get_model
     m = get_model()
     if m is None:
-        raise HTTPException(503, "Model not loaded — run train.py first")
+        return {"status": "no model loaded", "note": "Train and push models/ensemble_v5.pkl"}
     return {
         "version": "5.0.0",
         "base_models": ["CatBoost", "XGBoost", "LightGBM"],
@@ -255,5 +226,5 @@ async def model_info():
         "features": len(m.feature_names) if m.is_fitted else "untrained",
         "league_calibrators": list(m.calibrators.keys()),
         "fitted": m.is_fitted,
-    }
+        }
     
