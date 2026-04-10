@@ -9,14 +9,17 @@ from pydantic import BaseModel
 from typing import Optional, List
 import logging
 import os
+import pandas as pd
+import traceback
 
+# Setup Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="PredictIQ Pro ML API",
     version="5.0.0",
-    description="Ensemble: CatBoost + XGBoost + LightGBM | 163 features | Bzzoiro spatial"
+    description="Ensemble: CatBoost + XGBoost + LightGBM | 163 features"
 )
 
 app.add_middleware(
@@ -26,15 +29,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Auto-download model on startup
+# Shared training status
+_training_status = {"status": "idle", "message": "No training run yet"}
+
+# ── Startup Logic ──────────────────────────────────────
 @app.on_event("startup")
 async def startup():
-    from predictor import get_model
-    get_model()  # triggers Supabase download if needed
+    try:
+        from predictor import get_model
+        # This triggers the Supabase download if the .pkl isn't local
+        model = get_model()
+        if model:
+            logger.info("✅ PredictIQ Pro Model loaded successfully on startup.")
+        else:
+            logger.warning("⚠️ Application starting without a pre-loaded model.")
+    except Exception as e:
+        logger.error(f"❌ Startup error during model retrieval: {e}")
 
-
-# ── Request schema ─────────────────────────────────────
-
+# ── Request Schemas ────────────────────────────────────
 class PredictionRequest(BaseModel):
     league_id: int = 0
     league_tier: int = 1
@@ -181,156 +193,86 @@ class PredictionRequest(BaseModel):
     bzz_winner_recommend: int = 1
     bzz_model_version_enc: int = 5
 
-
 class TrainRequest(BaseModel):
-    date_from: str = "2025-10-01"   # start of training window
-    date_to: str = "2026-03-31"     # end of training window
-    league_id: Optional[int] = None # None = all leagues
+    date_from: str = "2025-10-01"
+    date_to: str = "2026-03-31"
+    league_id: Optional[int] = None
     n_folds: int = 5
-    secret: str = ""                # simple auth — set TRAIN_SECRET env var
-
+    secret: str = ""
 
 # ── Training job (runs in background) ─────────────────
-
 def _run_training(date_from: str, date_to: str, league_id, n_folds: int):
-    import pandas as pd
-    import traceback
     global _training_status
     _training_status = {"status": "running", "message": "Fetching data from Bzzoiro..."}
 
     try:
-        # 1. Fetch training data from Bzzoiro
         from api_bzzoiro import get_finished_predictions_for_training
         from features import engineer_features
         from train import EnsembleStacker
         from model_store import upload_model
+        import predictor
 
-        logger.info(f"Fetching matches {date_from} → {date_to}")
-        rows = get_finished_predictions_for_training(
-            date_from=date_from,
-            date_to=date_to,
-            league_id=league_id
-        )
-
+        # 1. Fetch
+        rows = get_finished_predictions_for_training(date_from, date_to, league_id)
         if len(rows) < 50:
-            _training_status = {"status": "error",
-                                 "message": f"Only {len(rows)} matches found — need at least 50"}
+            _training_status = {"status": "error", "message": f"Found only {len(rows)} matches. Need 50+."}
             return
 
         df = pd.DataFrame(rows)
         _training_status["message"] = f"Training on {len(df)} matches..."
-        logger.info(f"Training on {len(df)} matches")
 
-        X       = engineer_features(df)
-        y       = df["result"]
-        leagues = df.get("league_id", pd.Series([0] * len(df)))
-
-        # 2. Train ensemble
+        # 2. Train
+        X = engineer_features(df)
+        y = df["result"]
         model = EnsembleStacker(n_folds=n_folds)
-        model.fit(X, y, league_ids=leagues)
+        model.fit(X, y)
 
-        # 3. Upload to Supabase Storage
-        _training_status["message"] = "Uploading model to Supabase Storage..."
-        ok = upload_model(model)
-        if not ok:
-            _training_status = {"status": "error", "message": "Upload to Supabase failed"}
-            return
-
-        # 4. Hot-swap the in-memory model
-        import predictor
-        predictor._model = model
-
-        _training_status = {
-            "status":   "complete",
-            "message":  f"Trained on {len(df)} matches. Model live.",
-            "features": len(X.columns),
-            "samples":  len(df),
-        }
-        logger.info("✅ Training complete, model hot-swapped")
+        # 3. Upload & Hot-Swap
+        _training_status["message"] = "Uploading model to Supabase..."
+        if upload_model(model):
+            predictor._model = model # Hot-swap live model
+            _training_status = {
+                "status": "complete",
+                "message": f"Trained on {len(df)} matches. Model hot-swapped.",
+                "features": len(X.columns)
+            }
+        else:
+            _training_status = {"status": "error", "message": "Supabase upload failed."}
 
     except Exception as e:
-        _training_status = {"status": "error", "message": str(e)}
         logger.error(traceback.format_exc())
-
-
-_training_status = {"status": "idle", "message": "No training run yet"}
-
+        _training_status = {"status": "error", "message": str(e)}
 
 # ── Endpoints ──────────────────────────────────────────
-
 @app.get("/health")
 async def health():
     from predictor import get_model
     m = get_model()
     return {
-        "status":       "ok",
+        "status": "ok",
         "model_loaded": m is not None,
-        "version":      "5.0.0",
-        "architecture": "XGBoost + LightGBM + CatBoost → meta-learner",
+        "version": "5.0.0"
     }
-
 
 @app.post("/predict")
 async def predict_endpoint(req: PredictionRequest):
     try:
         from predictor import predict as run_predict
         return run_predict(req.dict())
-    except RuntimeError as e:
-        raise HTTPException(503, str(e))
     except Exception as e:
-        logger.error(f"Prediction error: {e}", exc_info=True)
         raise HTTPException(500, f"Prediction failed: {str(e)}")
-
-
-@app.post("/predict/batch")
-async def predict_batch(reqs: List[PredictionRequest]):
-    from predictor import predict as run_predict
-    out = []
-    for r in reqs:
-        try:
-            out.append(run_predict(r.dict()))
-        except Exception as e:
-            out.append({"error": str(e)})
-    return {"count": len(out), "predictions": out}
-
 
 @app.post("/train")
 async def trigger_training(req: TrainRequest, background_tasks: BackgroundTasks):
-    # Simple secret check
-    expected = os.getenv("TRAIN_SECRET", "")
-    if expected and req.secret != expected:
+    if req.secret != os.getenv("TRAIN_SECRET"):
         raise HTTPException(401, "Invalid secret")
-
-    if _training_status.get("status") == "running":
-        raise HTTPException(409, "Training already in progress")
-
-    background_tasks.add_task(
-        _run_training,
-        req.date_from,
-        req.date_to,
-        req.league_id,
-        req.n_folds,
-    )
-    return {"status": "started", "message": "Training running in background. Poll GET /train/status"}
-
+    if _training_status["status"] == "running":
+        raise HTTPException(409, "Training in progress")
+    
+    background_tasks.add_task(_run_training, req.date_from, req.date_to, req.league_id, req.n_folds)
+    return {"status": "started", "message": "Check /train/status for progress."}
 
 @app.get("/train/status")
 async def training_status():
     return _training_status
-
-
-@app.get("/model/info")
-async def model_info():
-    from predictor import get_model
-    m = get_model()
-    if m is None:
-        return {"status": "no model", "note": "Call POST /train to train"}
-    return {
-        "version":            "5.0.0",
-        "base_models":        ["CatBoost", "XGBoost", "LightGBM"],
-        "meta_learner":       "LogisticRegression",
-        "features":           len(m.feature_names) if m.is_fitted else "untrained",
-        "league_calibrators": list(m.calibrators.keys()),
-        "fitted":             m.is_fitted,
-    }
     
