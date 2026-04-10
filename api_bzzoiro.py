@@ -3,25 +3,31 @@ import time
 import requests
 from supabase import create_client, Client
 
-# 1. Configuration (Set these in Railway Variables)
-API_KEY       = os.getenv("BZZOIRD_API_KEY")
-SUPABASE_URL  = os.getenv("SUPABASE_URL")
-SUPABASE_KEY  = os.getenv("SUPABASE_SERVICE_KEY")
+# Configuration (Railway Variables)
+API_KEY      = os.getenv("BZZOIRD_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
-# Correct Auth For Bzzoiro
+# Bzzoiro base
 BASE_URL = "https://sports.bzzoiro.com/api"
 HEADERS  = {
     "Authorization": f"Token {API_KEY}",
     "Accept": "application/json"
 }
 
-# Initialize Supabase
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Lazy Supabase client — only created when actually needed
+_supabase_client = None
 
-# --- YOUR EXISTING FUNCTIONS (sync_bzzoiro_predictions, etc.) ---
-# Keep your existing sync_team_squad and get_player_stats here...
+def _get_supabase() -> Client:
+    global _supabase_client
+    if _supabase_client is None:
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _supabase_client
 
-# --- NEW FUNCTIONS START HERE ---
+
+# ─────────────────────────────────────────────
+# SPATIAL DATA HELPERS
+# ─────────────────────────────────────────────
 
 def _fetch_event_spatial(event_id: int) -> dict:
     """Fetch shotmap + momentum + avg_positions from a finished match."""
@@ -51,11 +57,11 @@ def _aggregate_spatial(spatial: dict) -> dict:
             xs    = [s["pos"]["x"] for s in shots if "pos" in s]
             xgs   = [s.get("xg", 0) for s in shots]
             xgots = [s.get("xgot", 0) for s in shots if s.get("xgot")]
-            out[f"{side}_avg_shot_x"]            = sum(xs) / len(xs) if xs else 85
-            out[f"{side}_avg_shot_xg"]           = sum(xgs) / len(xgs) if xgs else 0.10
-            out[f"{side}_xgot_ratio"]            = sum(xgots) / sum(xgs) if sum(xgs) > 0 else 1.0
-            out[f"{side}_header_goals_rate"]     = sum(1 for s in shots if s.get("body") == "head") / len(shots)
-            out[f"{side}_set_piece_goals_rate"]  = sum(1 for s in shots if s.get("sit") in ["corner", "free-kick", "penalty"]) / len(shots)
+            out[f"{side}_avg_shot_x"]           = sum(xs) / len(xs) if xs else 85
+            out[f"{side}_avg_shot_xg"]          = sum(xgs) / len(xgs) if xgs else 0.10
+            out[f"{side}_xgot_ratio"]           = sum(xgots) / sum(xgs) if sum(xgs) > 0 else 1.0
+            out[f"{side}_header_goals_rate"]    = sum(1 for s in shots if s.get("body") == "head") / len(shots)
+            out[f"{side}_set_piece_goals_rate"] = sum(1 for s in shots if s.get("sit") in ["corner", "free-kick", "penalty"]) / len(shots)
 
     # Momentum
     if momentum:
@@ -86,6 +92,10 @@ def _aggregate_spatial(spatial: dict) -> dict:
     return out
 
 
+# ─────────────────────────────────────────────
+# TRAINING DATA FETCH
+# ─────────────────────────────────────────────
+
 def get_finished_predictions_for_training(
     date_from: str,
     date_to: str,
@@ -114,17 +124,12 @@ def get_finished_predictions_for_training(
     for i, pred in enumerate(predictions):
         ev = pred["event"]
 
-        # Determine actual result from scores
+        # Determine actual result
         hs  = ev.get("home_score")
         as_ = ev.get("away_score")
         if hs is None or as_ is None:
             continue
-        if hs > as_:
-            result = "H"
-        elif as_ > hs:
-            result = "A"
-        else:
-            result = "D"
+        result = "H" if hs > as_ else ("A" if as_ > hs else "D")
 
         row = {
             "result":                  result,
@@ -161,8 +166,53 @@ def get_finished_predictions_for_training(
     return rows
 
 
+# ─────────────────────────────────────────────
+# LIVE PREDICTIONS (used by Supabase edge fn)
+# ─────────────────────────────────────────────
+
+def get_upcoming_predictions(league_id: int = None) -> list:
+    """Fetch today's upcoming predictions from Bzzoiro."""
+    params = {"upcoming": "true"}
+    if league_id:
+        params["league"] = league_id
+    r = requests.get(f"{BASE_URL}/predictions/", headers=HEADERS,
+                     params=params, timeout=30)
+    r.raise_for_status()
+    return r.json().get("results", [])
+
+
+def sync_predictions_to_supabase(predictions: list) -> int:
+    """Upsert Bzzoiro predictions into Supabase predictions table."""
+    sb = _get_supabase()
+    count = 0
+    for pred in predictions:
+        ev = pred["event"]
+        row = {
+            "bzzoiro_event_id":   ev["id"],
+            "home_team":          ev["home_team"],
+            "away_team":          ev["away_team"],
+            "event_date":         ev["event_date"],
+            "league_name":        ev["league"]["name"],
+            "prob_home_win":      pred.get("prob_home_win"),
+            "prob_draw":          pred.get("prob_draw"),
+            "prob_away_win":      pred.get("prob_away_win"),
+            "expected_home_goals":pred.get("expected_home_goals"),
+            "expected_away_goals":pred.get("expected_away_goals"),
+            "prob_over_25":       pred.get("prob_over_25"),
+            "prob_btts":          pred.get("prob_btts_yes"),
+            "confidence":         pred.get("confidence"),
+            "model_version":      pred.get("model_version", ""),
+        }
+        try:
+            sb.table("predictions").upsert(row, on_conflict="bzzoiro_event_id").execute()
+            count += 1
+        except Exception as e:
+            print(f"  Upsert failed event {ev['id']}: {e}")
+    return count
+
+
 if __name__ == "__main__":
-    # Test: fetch a small sample
+    # Quick test
     data = get_finished_predictions_for_training("2026-01-01", "2026-01-31")
     print(f"Fetched {len(data)} rows")
         
