@@ -4,7 +4,7 @@ import requests
 from supabase import create_client, Client
 
 # Configuration (Railway Variables)
-API_KEY      = os.getenv("BZZOIRD_API_KEY")
+API_KEY      = os.getenv("BZZOIRO_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
