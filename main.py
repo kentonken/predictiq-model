@@ -1,26 +1,20 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional
-from predictor import predict as run_predict, get_model # This matches the fix above
+# CRITICAL: This line must match your predictor.py function names
+from predictor import predict as run_predict, get_model 
 
 app = FastAPI(title="PredictIQ Pro API")
 
 class PredictionRequest(BaseModel):
-    # Removing '= 1500.0' forces the API to use REAL data
     league_id: int
     home_elo: float
     away_elo: float
-    home_form_pts_5: float
-    away_form_pts_5: float
-    home_xg_for_5: float
-    away_xg_for_5: float
-    bzz_expected_home_goals: Optional[float] = None
-    bzz_expected_away_goals: Optional[float] = None
+    # Add other required fields...
 
 @app.post("/predict")
-async def predict(req: PredictionRequest):
+async def predict_endpoint(req: PredictionRequest):
     try:
-        # Pass real data to the ensemble
+        # This calls the 'run_predict' (renamed from 'predict') in predictor.py
         return run_predict(req.dict())
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
