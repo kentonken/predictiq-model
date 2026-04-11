@@ -1,29 +1,28 @@
-import joblib
 import os
+import joblib
+import logging
 from pathlib import Path
 
-# Global variable to cache the model
-_model = None
+# Setup logging and paths
+logger = logging.getLogger(__name__)
 MODEL_PATH = Path(os.getenv("MODEL_PATH", "models/ensemble_v5.pkl"))
+_model = None
 
 def get_model():
-    """Function to load and return the model ensemble."""
+    """Returns the loaded v5 ensemble model."""
     global _model
     if _model is not None:
         return _model
     
     if MODEL_PATH.exists():
-        _model = joblib.load(MODEL_PATH)
-        return _model
+        try:
+            _model = joblib.load(MODEL_PATH)
+            logger.info("✅ Ensemble v5 loaded successfully.")
+            return _model
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
     
-    # Fallback if model doesn't exist yet
+    logger.warning("⚠️ No model found locally.")
     return None
 
-def predict(input_data: dict) -> dict:
-    """Main prediction logic engine."""
-    model = get_model()
-    if model is None:
-        raise RuntimeError("No model loaded. Call /train first.")
-    
-    # ... rest of your existing prediction code ...
-    
+# Keep your existing predict(input_data) function below this...
